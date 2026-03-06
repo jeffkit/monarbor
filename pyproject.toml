@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68.0", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "monarbor"
+version = "0.1.0"
+description = "Monarbor - AI 友好的逻辑大仓命令行工具"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "click>=8.0",
+    "pyyaml>=6.0",
+    "rich>=13.0",
+]
+
+[project.scripts]
+monarbor = "monarbor.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["monarbor*"]

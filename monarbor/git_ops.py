@@ -78,6 +78,29 @@ def ahead_behind(repo_path: Path) -> tuple[int, int]:
     return (0, 0)
 
 
+def list_worktrees(repo_path: Path) -> list[dict[str, str]]:
+    """列出仓库的所有 worktree，返回 [{path, branch, bare?}]。"""
+    result = run_git(["worktree", "list", "--porcelain"], cwd=repo_path)
+    if not result.ok:
+        return []
+    worktrees: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+    for line in result.output.splitlines():
+        if line.startswith("worktree "):
+            if current:
+                worktrees.append(current)
+            current = {"path": line[len("worktree "):]}
+        elif line.startswith("branch "):
+            current["branch"] = line[len("branch refs/heads/"):]
+        elif line == "bare":
+            current["bare"] = "true"
+        elif line == "detached":
+            current["branch"] = "(detached)"
+    if current:
+        worktrees.append(current)
+    return worktrees
+
+
 def run_in_repo(repo_path: Path, command: str) -> GitResult:
     """在仓库目录下执行任意 shell 命令。"""
     try:

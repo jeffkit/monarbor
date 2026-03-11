@@ -10,7 +10,7 @@ from rich.table import Table
 from rich.tree import Tree as RichTree
 
 from . import __version__
-from .config import CONFIG_FILENAME, MonorepoConfig, RepoDef, find_nested_monorepos, walk_monorepos
+from .config import CONFIG_FILENAME, LOCAL_CONFIG_FILENAME, MonorepoConfig, RepoDef, find_nested_monorepos, walk_monorepos
 from .git_ops import (
     ahead_behind,
     checkout,
@@ -18,6 +18,7 @@ from .git_ops import (
     current_branch,
     fetch,
     is_dirty,
+    list_worktrees,
     pull,
     run_in_repo,
 )
@@ -73,10 +74,12 @@ def clone_repos(recursive: bool, branch_type: str, path_filter: str | None):
                 continue
 
             branch = repo.branches.get(branch_type)
-            console.print(f"  [cyan]克隆[/cyan] {repo.name} → {repo.path} [dim](branch: {branch})[/dim]")
+            override_tag = " [yellow]⚡local[/yellow]" if repo.has_local_override else ""
+            console.print(f"  [cyan]克隆[/cyan] {repo.name} → {repo.path} [dim](branch: {branch})[/dim]{override_tag}")
             result = clone(repo.repo_url, target, branch=branch)
             if result.ok:
                 success += 1
+                _ensure_in_gitignore(target, ".worktrees/")
                 console.print(f"       [green]✓[/green]")
             else:
                 console.print(f"       [red]✗ {result.error}[/red]")
@@ -118,7 +121,8 @@ def pull_repos(recursive: bool):
 @main.command()
 @click.option("-r", "--recursive", is_flag=True, help="递归显示嵌套大仓")
 @click.option("--fetch/--no-fetch", default=False, help="先 fetch 远端再显示状态")
-def status(recursive: bool, fetch: bool):
+@click.option("--check-worktrees", is_flag=True, help="同时显示各仓库的活跃 worktree")
+def status(recursive: bool, fetch: bool, check_worktrees: bool):
     """显示所有仓库的当前状态。"""
     root = find_root()
     configs = list(walk_monorepos(root, recursive=recursive))
@@ -129,13 +133,18 @@ def status(recursive: bool, fetch: bool):
     table.add_column("分支", style="cyan")
     table.add_column("状态")
     table.add_column("同步")
+    if check_worktrees:
+        table.add_column("Worktrees")
 
     for config in configs:
         for repo in config.repos:
             target = config.root / repo.path
             rel_path = str(target.relative_to(root))
             if not (target / ".git").exists():
-                table.add_row(repo.name, rel_path, "-", "[dim]未 clone[/dim]", "-")
+                row = [repo.name, rel_path, "-", "[dim]未 clone[/dim]", "-"]
+                if check_worktrees:
+                    row.append("-")
+                table.add_row(*row)
                 continue
 
             if fetch:
@@ -143,6 +152,7 @@ def status(recursive: bool, fetch: bool):
                 git_fetch(target)
 
             branch = current_branch(target)
+            branch_display = f"{branch} [yellow]⚡local[/yellow]" if repo.has_local_override else branch
             dirty = is_dirty(target)
             dirty_label = "[red]有改动[/red]" if dirty else "[green]干净[/green]"
             a, b = ahead_behind(target)
@@ -153,7 +163,18 @@ def status(recursive: bool, fetch: bool):
                 sync_parts.append(f"[yellow]↓{b}[/yellow]")
             sync_label = " ".join(sync_parts) if sync_parts else "[green]同步[/green]"
 
-            table.add_row(repo.name, rel_path, branch, dirty_label, sync_label)
+            row = [repo.name, rel_path, branch_display, dirty_label, sync_label]
+
+            if check_worktrees:
+                wts = list_worktrees(target)
+                extra = [w for w in wts if w.get("path") != str(target.resolve())]
+                if extra:
+                    wt_labels = [f"{w.get('branch', '?')}" for w in extra]
+                    row.append("[magenta]" + ", ".join(wt_labels) + "[/magenta]")
+                else:
+                    row.append("[dim]无[/dim]")
+
+            table.add_row(*row)
 
     console.print(table)
 
@@ -246,12 +267,156 @@ def checkout_repos(branch_type: str, recursive: bool, path_filter: str | None):
             if not branch:
                 console.print(f"  [yellow]跳过[/yellow] {repo.name}: 未配置 {branch_type} 分支")
                 continue
-            console.print(f"  [cyan]切换[/cyan] {repo.name} → {branch}")
+            override_tag = " [yellow]⚡local[/yellow]" if repo.has_local_override else ""
+            console.print(f"  [cyan]切换[/cyan] {repo.name} → {branch}{override_tag}")
             result = checkout(target, branch)
             if result.ok:
                 console.print(f"       [green]✓[/green]")
             else:
                 console.print(f"       [red]✗ {result.error}[/red]")
+
+
+# ── monarbor local ───────────────────────────────────────────
+
+
+def _load_local_yaml(root: Path) -> dict:
+    local_path = root / LOCAL_CONFIG_FILENAME
+    if not local_path.exists():
+        return {"repos": []}
+    import yaml
+    with open(local_path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    if "repos" not in data:
+        data["repos"] = []
+    return data
+
+
+def _save_local_yaml(root: Path, data: dict) -> None:
+    import yaml
+    local_path = root / LOCAL_CONFIG_FILENAME
+    with open(local_path, "w", encoding="utf-8") as f:
+        yaml.dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    _ensure_gitignore(root)
+
+
+def _ensure_in_gitignore(root: Path, entry: str) -> None:
+    """确保指定条目在 .gitignore 中。"""
+    gitignore_path = root / ".gitignore"
+    if gitignore_path.exists():
+        content = gitignore_path.read_text(encoding="utf-8")
+        for line in content.splitlines():
+            if line.strip() == entry:
+                return
+        if not content.endswith("\n"):
+            content += "\n"
+        content += f"{entry}\n"
+        gitignore_path.write_text(content, encoding="utf-8")
+    else:
+        gitignore_path.write_text(f"{entry}\n", encoding="utf-8")
+
+
+def _ensure_gitignore(root: Path) -> None:
+    """确保 mona.local.yaml 在 .gitignore 中。"""
+    _ensure_in_gitignore(root, LOCAL_CONFIG_FILENAME)
+
+
+@main.group(name="local")
+def local_group():
+    """管理本地分支覆盖 (mona.local.yaml)。"""
+    pass
+
+
+@local_group.command(name="list")
+def local_list():
+    """查看当前所有本地覆盖。"""
+    root = find_root()
+    data = _load_local_yaml(root)
+    repos = data.get("repos", [])
+    if not repos:
+        console.print("[dim]无本地覆盖 (mona.local.yaml 不存在或为空)[/dim]")
+        return
+
+    table = Table(title="本地覆盖")
+    table.add_column("路径", style="bold")
+    table.add_column("覆盖字段")
+
+    for repo in repos:
+        path = repo.get("path", "(unknown)")
+        branches = repo.get("branches", {})
+        parts = [f"{k}={v}" for k, v in branches.items()]
+        table.add_row(path, ", ".join(parts) if parts else "[dim]无分支覆盖[/dim]")
+
+    console.print(table)
+
+
+@local_group.command(name="set")
+@click.argument("repo_path")
+@click.argument("branch")
+@click.option("-t", "--branch-type", type=click.Choice(["dev", "test", "prod"]), default="dev", help="覆盖哪个分支类型 (默认 dev)")
+def local_set(repo_path: str, branch: str, branch_type: str):
+    """为指定 repo 设置本地分支覆盖。
+
+    示例: monarbor local set infra/argusai feat/new-api
+    """
+    root = find_root()
+
+    config = MonorepoConfig.load(root)
+    known_paths = {r.path for r in config.repos}
+    if repo_path not in known_paths:
+        raise click.ClickException(f"路径 {repo_path} 不在 mona.yaml 中，已知路径: {', '.join(sorted(known_paths))}")
+
+    data = _load_local_yaml(root)
+    repos = data.get("repos", [])
+
+    target = None
+    for r in repos:
+        if r.get("path") == repo_path:
+            target = r
+            break
+
+    if target is None:
+        target = {"path": repo_path, "branches": {}}
+        repos.append(target)
+
+    if "branches" not in target:
+        target["branches"] = {}
+    target["branches"][branch_type] = branch
+    data["repos"] = repos
+
+    _save_local_yaml(root, data)
+    console.print(f"[green]✓[/green] {repo_path} 的 {branch_type} 分支已覆盖为 [cyan]{branch}[/cyan]")
+
+
+@local_group.command(name="unset")
+@click.argument("repo_path")
+def local_unset(repo_path: str):
+    """移除指定 repo 的所有本地覆盖。"""
+    root = find_root()
+    data = _load_local_yaml(root)
+    repos = data.get("repos", [])
+    original_len = len(repos)
+    repos = [r for r in repos if r.get("path") != repo_path]
+
+    if len(repos) == original_len:
+        console.print(f"[yellow]未找到[/yellow] {repo_path} 的本地覆盖")
+        return
+
+    data["repos"] = repos
+    _save_local_yaml(root, data)
+    console.print(f"[green]✓[/green] 已移除 {repo_path} 的本地覆盖")
+
+
+@local_group.command(name="clear")
+@click.confirmation_option(prompt="确认清除所有本地覆盖？")
+def local_clear():
+    """清除所有本地覆盖。"""
+    root = find_root()
+    local_path = root / LOCAL_CONFIG_FILENAME
+    if local_path.exists():
+        local_path.unlink()
+        console.print("[green]✓[/green] 已删除 mona.local.yaml")
+    else:
+        console.print("[dim]mona.local.yaml 不存在，无需清除[/dim]")
 
 
 # ── monarbor init ────────────────────────────────────────────
@@ -273,6 +438,7 @@ owner: {owner}
 repos: []
 """
     config_path.write_text(content, encoding="utf-8")
+    _ensure_gitignore(Path.cwd())
     console.print(f"[green]✓[/green] 已创建 {CONFIG_FILENAME}")
 
 

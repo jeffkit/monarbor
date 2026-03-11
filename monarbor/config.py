@@ -10,6 +10,35 @@ from typing import Iterator
 import yaml
 
 CONFIG_FILENAME = "mona.yaml"
+LOCAL_CONFIG_FILENAME = "mona.local.yaml"
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """深度合并两个字典，override 优先。"""
+    result = base.copy()
+    for key, value in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def _apply_local_overrides(
+    repos: list[dict], local_repos: list[dict],
+) -> tuple[list[dict], set[str]]:
+    """按 path 匹配并合并 local 覆盖。返回 (合并后的列表, 被覆盖的 path 集合)。"""
+    local_map = {r["path"]: r for r in local_repos if "path" in r}
+    merged = []
+    overridden_paths: set[str] = set()
+    for repo in repos:
+        override = local_map.get(repo.get("path", ""))
+        if override:
+            merged.append(_deep_merge(repo, override))
+            overridden_paths.add(repo["path"])
+        else:
+            merged.append(repo)
+    return merged, overridden_paths
 
 
 @dataclass
@@ -22,6 +51,7 @@ class RepoDef:
     description: str = ""
     tech_stack: list[str] = field(default_factory=list)
     branches: dict[str, str] = field(default_factory=dict)
+    has_local_override: bool = False
 
     @property
     def dev_branch(self) -> str:
@@ -53,7 +83,31 @@ class MonorepoConfig:
             raise FileNotFoundError(f"未找到配置文件: {config_path}")
         with open(config_path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
-        repos = [RepoDef(**r) for r in data.get("repos", [])]
+
+        raw_repos = data.get("repos", [])
+        overridden_paths: set[str] = set()
+
+        local_path = root / LOCAL_CONFIG_FILENAME
+        if local_path.exists():
+            with open(local_path, "r", encoding="utf-8") as f:
+                local_data = yaml.safe_load(f) or {}
+            local_repos = local_data.get("repos", [])
+            if local_repos:
+                raw_repos, overridden_paths = _apply_local_overrides(raw_repos, local_repos)
+
+        repos = []
+        for r in raw_repos:
+            rd = RepoDef(
+                path=r.get("path", ""),
+                name=r.get("name", ""),
+                repo_url=r.get("repo_url", ""),
+                description=r.get("description", ""),
+                tech_stack=r.get("tech_stack", []),
+                branches=r.get("branches", {}),
+                has_local_override=r.get("path", "") in overridden_paths,
+            )
+            repos.append(rd)
+
         return cls(
             name=data.get("name", ""),
             owner=data.get("owner", ""),

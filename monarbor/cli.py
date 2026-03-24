@@ -15,6 +15,7 @@ from .git_ops import (
     ahead_behind,
     checkout,
     clone,
+    clone_into_existing,
     current_branch,
     fetch,
     is_dirty,
@@ -76,7 +77,10 @@ def clone_repos(recursive: bool, branch_type: str, path_filter: str | None):
             branch = repo.branches.get(branch_type)
             override_tag = " [yellow]⚡local[/yellow]" if repo.has_local_override else ""
             console.print(f"  [cyan]克隆[/cyan] {repo.name} → {repo.path} [dim](branch: {branch})[/dim]{override_tag}")
-            result = clone(repo.repo_url, target, branch=branch)
+            if target.exists() and target.is_dir():
+                result = clone_into_existing(repo.repo_url, target, branch=branch)
+            else:
+                result = clone(repo.repo_url, target, branch=branch)
             if result.ok:
                 success += 1
                 _ensure_in_gitignore(target, ".worktrees/")

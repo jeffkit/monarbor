@@ -42,6 +42,28 @@ def clone(repo_url: str, target: Path, branch: str | None = None) -> GitResult:
     return run_git(args)
 
 
+def clone_into_existing(repo_url: str, target: Path, branch: str | None = None) -> GitResult:
+    """Clone into a non-empty directory (e.g. containing mona.yaml) via init+remote+fetch+checkout."""
+    result = run_git(["init"], cwd=target)
+    if not result.ok:
+        return result
+    result = run_git(["remote", "add", "origin", repo_url], cwd=target)
+    if not result.ok:
+        return result
+    fetch_args = ["fetch", "origin"]
+    if branch:
+        fetch_args.append(branch)
+    result = run_git(fetch_args, cwd=target)
+    if not result.ok:
+        return result
+    ref = branch or "HEAD"
+    result = run_git(["checkout", "-b", ref, f"origin/{ref}"], cwd=target)
+    if not result.ok:
+        # branch may already exist, try plain checkout
+        result = run_git(["checkout", ref], cwd=target)
+    return result
+
+
 def pull(repo_path: Path) -> GitResult:
     return run_git(["pull"], cwd=repo_path)
 

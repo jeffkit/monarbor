@@ -51,27 +51,32 @@ def main():
 
 
 @main.command(name="clone")
-@click.option("-r", "--recursive", is_flag=True, help="递归 clone 嵌套的子逻辑大仓")
+@click.option("-r", "--recursive", is_flag=True, help="递归 clone 嵌套的子逻辑大仓（含嵌套大仓内的所有子仓库）")
 @click.option("-b", "--branch-type", type=click.Choice(["dev", "test", "prod"]), default="dev", help="clone 哪个分支类型 (默认 dev)")
 @click.option("--filter", "path_filter", default=None, help="只 clone 路径前缀匹配的仓库 (如 business-a)")
 def clone_repos(recursive: bool, branch_type: str, path_filter: str | None):
     """拉取大仓下所有项目代码。"""
     root = find_root()
-    configs = list(walk_monorepos(root, recursive=recursive))
     total, success, skipped = 0, 0, 0
 
-    for config in configs:
+    def _clone_config(config: "MonorepoConfig") -> None:
+        nonlocal total, success, skipped
         if config.root != root:
             console.rule(f"[bold]嵌套大仓: {config.name}[/bold] ({config.root.relative_to(root)})")
 
         for repo in config.repos:
             if path_filter and not repo.path.startswith(path_filter):
                 continue
+            if not repo.repo_url:
+                console.print(f"  [yellow]跳过[/yellow] {repo.name} ({repo.path}) [dim]— repo_url 未配置[/dim]")
+                skipped += 1
+                continue
             total += 1
             target = config.root / repo.path
             if target.exists() and (target / ".git").exists():
                 console.print(f"  [dim]跳过[/dim] {repo.path} (已存在)")
                 skipped += 1
+                total -= 1
                 continue
 
             branch = repo.branches.get(branch_type)
@@ -85,38 +90,84 @@ def clone_repos(recursive: bool, branch_type: str, path_filter: str | None):
                 success += 1
                 _ensure_in_gitignore(target, ".worktrees/")
                 console.print(f"       [green]✓[/green]")
+                # 若该仓库本身也是嵌套大仓，递归 clone 其子仓库
+                if recursive and (target / CONFIG_FILENAME).exists():
+                    try:
+                        nested_config = MonorepoConfig.load(target)
+                        _clone_config(nested_config)
+                    except Exception as e:
+                        console.print(f"       [yellow]⚠ 无法加载嵌套大仓 {repo.path}: {e}[/yellow]")
             else:
                 console.print(f"       [red]✗ {result.error}[/red]")
 
-    console.print(f"\n[bold]完成:[/bold] {success} 克隆, {skipped} 跳过, {total - success - skipped} 失败 (共 {total})")
+    # 首先处理顶层大仓
+    top_config = MonorepoConfig.load(root)
+    _clone_config(top_config)
+
+    # 递归时，还需处理已存在的嵌套大仓（clone 前就已在本地的）
+    if recursive:
+        repo_paths = {r.path.split("/")[0] for r in top_config.repos}
+        for nested_root in find_nested_monorepos(root, exclude_paths=repo_paths):
+            try:
+                nested_config = MonorepoConfig.load(nested_root)
+                _clone_config(nested_config)
+            except Exception as e:
+                console.print(f"  [yellow]⚠ 无法加载嵌套大仓 {nested_root}: {e}[/yellow]")
+
+    console.print(f"\n[bold]完成:[/bold] {success} 克隆, {skipped} 跳过, {total - success} 失败 (共 {total})")
 
 
 # ── monarbor pull ────────────────────────────────────────────
 
 
 @main.command(name="pull")
-@click.option("-r", "--recursive", is_flag=True, help="递归 pull 嵌套大仓")
-def pull_repos(recursive: bool):
+@click.option("-r", "--recursive", is_flag=True, help="递归 pull 嵌套大仓（含嵌套大仓内的所有子仓库）")
+@click.option("--clone-missing", is_flag=True, help="对未 clone 的仓库自动执行 clone")
+@click.option("-b", "--branch-type", type=click.Choice(["dev", "test", "prod"]), default="dev", help="clone 缺失仓库时使用的分支类型 (默认 dev，与 --clone-missing 配合使用)")
+def pull_repos(recursive: bool, clone_missing: bool, branch_type: str):
     """拉取所有已 clone 仓库的最新代码。"""
     root = find_root()
     configs = list(walk_monorepos(root, recursive=recursive))
-    total, success = 0, 0
+    total, success, missing = 0, 0, 0
 
     for config in configs:
+        if config.root != root:
+            console.rule(f"[bold]嵌套大仓: {config.name}[/bold] ({config.root.relative_to(root)})")
         for repo in config.repos:
             target = config.root / repo.path
             if not (target / ".git").exists():
+                if clone_missing and repo.repo_url:
+                    total += 1
+                    branch = repo.branches.get(branch_type)
+                    console.print(f"  [cyan]克隆[/cyan] {repo.name} ({repo.path}) [dim](branch: {branch})[/dim]")
+                    if target.exists() and target.is_dir():
+                        result = clone_into_existing(repo.repo_url, target, branch=branch)
+                    else:
+                        result = clone(repo.repo_url, target, branch=branch)
+                    if result.ok:
+                        success += 1
+                        _ensure_in_gitignore(target, ".worktrees/")
+                        console.print(f"       [green]✓[/green]")
+                    else:
+                        console.print(f"       [red]✗ {result.error}[/red]")
+                else:
+                    missing += 1
+                    url_hint = "" if repo.repo_url else " [dim](repo_url 未配置)[/dim]"
+                    console.print(f"  [dim]未 clone[/dim] {repo.name} ({repo.path}){url_hint}")
                 continue
             total += 1
             console.print(f"  [cyan]拉取[/cyan] {repo.name} ({repo.path})")
             result = pull(target)
             if result.ok:
                 success += 1
-                console.print(f"       [green]✓[/green] {result.output or 'Already up to date.'}")
+                console.print(f"       [green]✓[/green] {result.output or '已经是最新的。'}")
             else:
                 console.print(f"       [red]✗ {result.error}[/red]")
 
-    console.print(f"\n[bold]完成:[/bold] {success}/{total} 成功")
+    if missing:
+        console.print(f"\n[bold]完成:[/bold] {success}/{total} 成功, [yellow]{missing} 个仓库未 clone[/yellow]（运行 monarbor clone 或 monarbor pull --clone-missing 来补全）")
+    else:
+        console.print(f"\n[bold]完成:[/bold] {success}/{total} 成功")
 
 
 # ── monarbor status ──────────────────────────────────────────

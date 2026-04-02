@@ -18,10 +18,12 @@ from .git_ops import (
     clone_into_existing,
     current_branch,
     fetch,
+    get_remote_url,
     is_dirty,
     list_worktrees,
     pull,
     run_in_repo,
+    set_remote_url,
 )
 
 console = Console()
@@ -45,6 +47,18 @@ def find_root(start: Path | None = None) -> Path:
 def main():
     """Monarbor - AI 友好的逻辑大仓命令行工具"""
     pass
+
+
+def _sync_remote_if_needed(repo: RepoDef, target: Path, remote: str = "origin") -> None:
+    """检查本地 remote URL 是否与 mona.yaml 一致，不一致则自动更新。"""
+    current_url = get_remote_url(target, remote)
+    if current_url is None or current_url == repo.repo_url:
+        return
+    result = set_remote_url(target, repo.repo_url, remote)
+    if result.ok:
+        console.print(f"  [yellow]同步[/yellow] {repo.path} remote: {current_url} → {repo.repo_url}")
+    else:
+        console.print(f"  [red]✗[/red] {repo.path} remote 同步失败: {result.error}")
 
 
 # ── monarbor clone ───────────────────────────────────────────
@@ -74,6 +88,7 @@ def clone_repos(recursive: bool, branch_type: str, path_filter: str | None):
             total += 1
             target = config.root / repo.path
             if target.exists() and (target / ".git").exists():
+                _sync_remote_if_needed(repo, target)
                 console.print(f"  [dim]跳过[/dim] {repo.path} (已存在)")
                 skipped += 1
                 total -= 1

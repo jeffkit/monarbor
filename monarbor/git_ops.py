@@ -64,6 +64,17 @@ def clone_into_existing(repo_url: str, target: Path, branch: str | None = None) 
     return result
 
 
+def get_remote_url(repo_path: Path, remote: str = "origin") -> str | None:
+    """获取指定 remote 的 URL，不存在则返回 None。"""
+    result = run_git(["remote", "get-url", remote], cwd=repo_path)
+    return result.output if result.ok else None
+
+
+def set_remote_url(repo_path: Path, url: str, remote: str = "origin") -> GitResult:
+    """原地更新指定 remote 的 URL。"""
+    return run_git(["remote", "set-url", remote, url], cwd=repo_path)
+
+
 def pull(repo_path: Path) -> GitResult:
     return run_git(["pull"], cwd=repo_path)
 

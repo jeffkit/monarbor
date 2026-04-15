@@ -92,6 +92,10 @@ def clone_repos(recursive: bool, branch_type: str, path_filter: str | None):
                 console.print(f"  [dim]跳过[/dim] {repo.path} (已存在)")
                 skipped += 1
                 total -= 1
+                # 已存在的 repo 如果自身含嵌套大仓，仍需递归处理
+                if recursive and (target / CONFIG_FILENAME).exists():
+                    for nested_config in walk_monorepos(target, recursive=True):
+                        _clone_config(nested_config)
                 continue
 
             branch = repo.branches.get(branch_type)
@@ -105,11 +109,11 @@ def clone_repos(recursive: bool, branch_type: str, path_filter: str | None):
                 success += 1
                 _ensure_in_git_exclude(target, ".worktrees/")
                 console.print(f"       [green]✓[/green]")
-                # 若该仓库本身也是嵌套大仓，递归 clone 其子仓库
+                # 若该仓库本身也是嵌套大仓，递归 clone 其子仓库（任意深度）
                 if recursive and (target / CONFIG_FILENAME).exists():
                     try:
-                        nested_config = MonorepoConfig.load(target)
-                        _clone_config(nested_config)
+                        for nested_config in walk_monorepos(target, recursive=True):
+                            _clone_config(nested_config)
                     except Exception as e:
                         console.print(f"       [yellow]⚠ 无法加载嵌套大仓 {repo.path}: {e}[/yellow]")
             else:
@@ -121,8 +125,8 @@ def clone_repos(recursive: bool, branch_type: str, path_filter: str | None):
 
     # 递归时，还需处理已存在的嵌套大仓（clone 前就已在本地的）
     if recursive:
-        repo_paths = {r.path.split("/")[0] for r in top_config.repos}
-        for nested_root in find_nested_monorepos(root, exclude_paths=repo_paths):
+        repo_abs_paths = {str((root / r.path).resolve()) for r in top_config.repos}
+        for nested_root in find_nested_monorepos(root, exclude_paths=repo_abs_paths):
             try:
                 nested_config = MonorepoConfig.load(nested_root)
                 _clone_config(nested_config)

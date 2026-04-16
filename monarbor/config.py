@@ -118,13 +118,16 @@ class MonorepoConfig:
 
 
 def find_nested_monorepos(root: Path, exclude_paths: set[str] | None = None) -> list[Path]:
-    """扫描子目录，找到所有嵌套的逻辑大仓。"""
+    """扫描子目录，找到所有嵌套的逻辑大仓。
+
+    exclude_paths 为绝对路径集合，匹配时使用精确路径比较（而非目录名）。
+    """
     nested = []
     exclude = exclude_paths or set()
     for entry in sorted(root.iterdir()):
         if not entry.is_dir() or entry.name.startswith("."):
             continue
-        if entry.name in exclude:
+        if str(entry.resolve()) in exclude:
             continue
         config = entry / CONFIG_FILENAME
         if config.exists():
@@ -135,11 +138,31 @@ def find_nested_monorepos(root: Path, exclude_paths: set[str] | None = None) -> 
 
 
 def walk_monorepos(root: Path, recursive: bool = False) -> Iterator[MonorepoConfig]:
-    """遍历当前大仓，可选递归加载嵌套大仓。"""
+    """遍历当前大仓，可选递归加载嵌套大仓。
+
+    递归发现嵌套大仓来自两个来源：
+    1. 已注册的 repo 目录自身含 mona.yaml → 作为嵌套大仓递归
+    2. 文件系统扫描发现的、未被注册为 repo 的目录含 mona.yaml
+    """
     config = MonorepoConfig.load(root)
     yield config
 
     if recursive:
-        repo_paths = {r.path.split("/")[0] for r in config.repos}
-        for nested_root in find_nested_monorepos(root, exclude_paths=repo_paths):
-            yield from walk_monorepos(nested_root, recursive=True)
+        # 收集已注册 repo 的精确绝对路径（用于 find_nested_monorepos 排除）
+        repo_abs_paths: set[str] = set()
+        # 已经通过 repo 递归处理过的路径（防止 find_nested 重复发现）
+        visited: set[str] = set()
+
+        # 来源 1：已注册 repo 自身含 mona.yaml
+        for repo in config.repos:
+            repo_dir = config.root / repo.path
+            repo_abs = str(repo_dir.resolve())
+            repo_abs_paths.add(repo_abs)
+            if repo_dir.is_dir() and (repo_dir / CONFIG_FILENAME).exists():
+                visited.add(repo_abs)
+                yield from walk_monorepos(repo_dir, recursive=True)
+
+        # 来源 2：文件系统扫描（排除已注册 repo 的精确路径，避免重复）
+        for nested_root in find_nested_monorepos(root, exclude_paths=repo_abs_paths | visited):
+            if str(nested_root.resolve()) not in visited:
+                yield from walk_monorepos(nested_root, recursive=True)

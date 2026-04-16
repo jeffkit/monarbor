@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import concurrent.futures
+import threading
 from pathlib import Path
 
 import click
@@ -12,6 +14,7 @@ from rich.tree import Tree as RichTree
 from . import __version__
 from .config import CONFIG_FILENAME, LOCAL_CONFIG_FILENAME, MonorepoConfig, RepoDef, find_nested_monorepos, walk_monorepos
 from .git_ops import (
+    CloneOptions,
     ahead_behind,
     checkout,
     clone,
@@ -68,30 +71,85 @@ def _sync_remote_if_needed(repo: RepoDef, target: Path, remote: str = "origin") 
 @click.option("-r", "--recursive", is_flag=True, help="递归 clone 嵌套的子逻辑大仓（含嵌套大仓内的所有子仓库）")
 @click.option("-b", "--branch-type", type=click.Choice(["dev", "test", "prod"]), default="dev", help="clone 哪个分支类型 (默认 dev)")
 @click.option("--filter", "path_filter", default=None, help="只 clone 路径前缀匹配的仓库 (如 business-a)")
-def clone_repos(recursive: bool, branch_type: str, path_filter: str | None):
-    """拉取大仓下所有项目代码。"""
+@click.option("--shallow", is_flag=True, help="浅克隆 (--depth 1)，跳过历史记录，大仓速度大幅提升")
+@click.option("--depth", type=int, default=None, help="浅克隆深度，只拉取最近 N 个 commit (如 --depth 50)")
+@click.option("--git-filter", "git_filter", default=None, metavar="FILTER",
+              help="git partial clone 过滤器 (如 blob:none 跳过大文件，tree:0 只拉提交历史)")
+@click.option("--single-branch", "single_branch", is_flag=True, help="只拉取指定分支，不拉其他远端分支")
+@click.option("--no-tags", "no_tags", is_flag=True, help="跳过 tag，减少传输量")
+@click.option("--jobs", type=int, default=1, show_default=True, help="并行 clone 的线程数，多仓库时可显著提速 (如 --jobs 4)")
+@click.option("--timeout", type=int, default=300, show_default=True, help="单个仓库 clone 的超时时间（秒）")
+def clone_repos(
+    recursive: bool,
+    branch_type: str,
+    path_filter: str | None,
+    shallow: bool,
+    depth: int | None,
+    git_filter: str | None,
+    single_branch: bool,
+    no_tags: bool,
+    jobs: int,
+    timeout: int,
+):
+    """拉取大仓下所有项目代码。
+
+    \b
+    快速 clone 大仓的常用姿势：
+      monarbor clone --shallow               # 浅克隆，只取最新快照
+      monarbor clone --depth 50              # 只取最近 50 个 commit
+      monarbor clone --git-filter blob:none  # blobless 克隆，跳过大文件
+      monarbor clone --jobs 4                # 4 线程并行 clone
+      monarbor clone --shallow --jobs 4      # 组合使用，效果最佳
+    """
     root = find_root()
+
+    # shallow flag 是 --depth 1 的快捷方式
+    effective_depth = 1 if shallow else depth
+
+    clone_opts = CloneOptions(
+        depth=effective_depth,
+        filter=git_filter,
+        single_branch=single_branch,
+        no_tags=no_tags,
+        timeout=timeout,
+    )
+
     total, success, skipped = 0, 0, 0
+    _lock = threading.Lock()
+
+    def _do_clone(repo: "RepoDef", config: "MonorepoConfig") -> tuple[str, bool, str]:
+        """执行单个仓库的 clone，返回 (path, ok, message)。"""
+        target = config.root / repo.path
+        branch = repo.branches.get(branch_type)
+        if target.exists() and target.is_dir():
+            result = clone_into_existing(repo.repo_url, target, branch=branch, options=clone_opts)
+        else:
+            result = clone(repo.repo_url, target, branch=branch, options=clone_opts)
+        if result.ok:
+            _ensure_in_git_exclude(target, ".worktrees/")
+        return (repo.path, result.ok, result.error)
 
     def _clone_config(config: "MonorepoConfig") -> None:
         nonlocal total, success, skipped
         if config.root != root:
             console.rule(f"[bold]嵌套大仓: {config.name}[/bold] ({config.root.relative_to(root)})")
 
+        pending: list[tuple["RepoDef", "MonorepoConfig"]] = []
+
         for repo in config.repos:
             if path_filter and not repo.path.startswith(path_filter):
                 continue
             if not repo.repo_url:
                 console.print(f"  [yellow]跳过[/yellow] {repo.name} ({repo.path}) [dim]— repo_url 未配置[/dim]")
-                skipped += 1
+                with _lock:
+                    skipped += 1
                 continue
-            total += 1
             target = config.root / repo.path
             if target.exists() and (target / ".git").exists():
                 _sync_remote_if_needed(repo, target)
                 console.print(f"  [dim]跳过[/dim] {repo.path} (已存在)")
-                skipped += 1
-                total -= 1
+                with _lock:
+                    skipped += 1
                 # 已存在的 repo 如果自身含嵌套大仓，仍需递归处理
                 if recursive and (target / CONFIG_FILENAME).exists():
                     try:
@@ -103,24 +161,52 @@ def clone_repos(recursive: bool, branch_type: str, path_filter: str | None):
 
             branch = repo.branches.get(branch_type)
             override_tag = " [yellow]⚡local[/yellow]" if repo.has_local_override else ""
-            console.print(f"  [cyan]克隆[/cyan] {repo.name} → {repo.path} [dim](branch: {branch})[/dim]{override_tag}")
-            if target.exists() and target.is_dir():
-                result = clone_into_existing(repo.repo_url, target, branch=branch)
-            else:
-                result = clone(repo.repo_url, target, branch=branch)
-            if result.ok:
-                success += 1
-                _ensure_in_git_exclude(target, ".worktrees/")
-                console.print(f"       [green]✓[/green]")
+            depth_hint = f", depth={effective_depth}" if effective_depth else ""
+            filter_hint = f", filter={git_filter}" if git_filter else ""
+            console.print(
+                f"  [cyan]克隆[/cyan] {repo.name} → {repo.path} "
+                f"[dim](branch: {branch}{depth_hint}{filter_hint})[/dim]{override_tag}"
+            )
+            with _lock:
+                total += 1
+            pending.append((repo, config))
+
+        if not pending:
+            return
+
+        def _handle_result(repo: "RepoDef", ok: bool, error: str) -> None:
+            nonlocal success
+            if ok:
+                with _lock:
+                    success += 1
+                console.print(f"  [green]✓[/green] {repo.path}")
                 # 若该仓库本身也是嵌套大仓，递归 clone 其子仓库（任意深度）
-                if recursive and (target / CONFIG_FILENAME).exists():
+                if recursive and (config.root / repo.path / CONFIG_FILENAME).exists():
                     try:
-                        for nested_config in walk_monorepos(target, recursive=True):
+                        for nested_config in walk_monorepos(config.root / repo.path, recursive=True):
                             _clone_config(nested_config)
                     except Exception as e:
-                        console.print(f"       [yellow]⚠ 无法加载嵌套大仓 {repo.path}: {e}[/yellow]")
+                        console.print(f"  [yellow]⚠ 无法加载嵌套大仓 {repo.path}: {e}[/yellow]")
             else:
-                console.print(f"       [red]✗ {result.error}[/red]")
+                console.print(f"  [red]✗[/red] {repo.path}: {error}")
+
+        if jobs > 1:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as executor:
+                futures = {
+                    executor.submit(_do_clone, repo, cfg): repo
+                    for repo, cfg in pending
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    repo = futures[future]
+                    try:
+                        _, ok, error = future.result()
+                        _handle_result(repo, ok, error)
+                    except Exception as e:
+                        console.print(f"  [red]✗[/red] {repo.path}: {e}")
+        else:
+            for repo, cfg in pending:
+                _, ok, error = _do_clone(repo, cfg)
+                _handle_result(repo, ok, error)
 
     # 首先处理顶层大仓
     top_config = MonorepoConfig.load(root)

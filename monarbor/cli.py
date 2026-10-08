@@ -12,7 +12,16 @@ from rich.table import Table
 from rich.tree import Tree as RichTree
 
 from . import __version__
-from .config import CONFIG_FILENAME, LOCAL_CONFIG_FILENAME, MonorepoConfig, RepoDef, find_nested_monorepos, walk_monorepos
+from .config import (
+    CONFIG_FILENAME,
+    LOCAL_CONFIG_FILENAME,
+    MonorepoConfig,
+    RepoDef,
+    find_nested_monorepos,
+    registered_repo_abs_paths,
+    walk_monorepos,
+)
+from .doctor import DEFAULT_ASSERTIONS_FILE, load_assertions, run_assertions
 from .git_ops import (
     CloneOptions,
     ahead_behind,
@@ -214,7 +223,7 @@ def clone_repos(
 
     # 递归时，还需处理已存在的嵌套大仓（clone 前就已在本地的）
     if recursive:
-        repo_abs_paths = {str((root / r.path).resolve()) for r in top_config.repos}
+        repo_abs_paths = registered_repo_abs_paths(top_config)
         for nested_root in find_nested_monorepos(root, exclude_paths=repo_abs_paths):
             try:
                 nested_config = MonorepoConfig.load(nested_root)
@@ -370,11 +379,72 @@ def list_repos(recursive: bool):
                     sub_path = "/".join(repo.path.split("/")[1:])
                     branch.add(f"{repo.name} [dim]{sub_path}[/dim] [cyan]{'|'.join(repo.tech_stack)}[/cyan]")
 
-        nested = find_nested_monorepos(config.root)
+        # 传入已注册子仓的精确绝对路径，避免递归进入已登记子仓（缺陷 B 正解）
+        nested = find_nested_monorepos(config.root, exclude_paths=registered_repo_abs_paths(config))
         for n in nested:
             tree.add(f"[bold magenta]📦 {n.name}/[/bold magenta] [dim](嵌套大仓)[/dim]")
 
         console.print(tree)
+
+
+# ── monarbor doctor ──────────────────────────────────────────
+
+
+@main.command(name="doctor")
+@click.option("--file", "assertions_file", default=DEFAULT_ASSERTIONS_FILE, show_default=True,
+              help="断言表路径（相对 cwd，默认 docs/DOC_ASSERTIONS.yml）")
+@click.option("--root", "root_opt", default=None, help="大仓根目录（默认当前目录）")
+@click.option("--json", "as_json", is_flag=True, help="以 JSON 输出机器可读结果（供 CI 消费）")
+def doctor(assertions_file: str, root_opt: str | None, as_json: bool):
+    """逐条执行文档事实断言表，失败即文档漂移（退出码 1）。
+
+    \b
+    示例:
+      monarbor doctor              # 在大仓根运行，人读输出
+      monarbor doctor --json       # CI 消费
+      monarbor doctor --file /path/to/DOC_ASSERTIONS.yml
+    """
+    root = Path(root_opt).resolve() if root_opt else Path.cwd().resolve()
+
+    assertions_path = Path(assertions_file)
+    if not assertions_path.is_absolute():
+        candidate = Path.cwd() / assertions_file
+        assertions_path = candidate if candidate.exists() else root / assertions_file
+
+    try:
+        assertions = load_assertions(assertions_path)
+    except Exception as e:
+        raise click.ClickException(f"无法加载断言表 {assertions_path}: {e}")
+
+    results = run_assertions(assertions, root)
+    passed = sum(1 for r in results if r.ok)
+    failed = len(results) - passed
+
+    if as_json:
+        import json
+
+        click.echo(json.dumps({
+            "file": str(assertions_path),
+            "root": str(root),
+            "total": len(results),
+            "passed": passed,
+            "failed": failed,
+            "ok": failed == 0,
+            "results": [r.as_dict() for r in results],
+        }, ensure_ascii=False, indent=2))
+    else:
+        for r in results:
+            mark = "[green]✓[/green]" if r.ok else "[red]✗[/red]"
+            console.print(f"{mark} [bold]{r.id}[/bold] [dim]({r.check})[/dim] {r.detail}")
+        summary = f"[bold]doctor:[/bold] {passed}/{len(results)} 通过"
+        if failed:
+            summary += f"，[red]{failed} 条失败[/red]"
+        else:
+            summary += "，[green]全部通过[/green]"
+        console.print(summary)
+
+    if failed:
+        raise SystemExit(1)
 
 
 # ── monarbor exec ────────────────────────────────────────────

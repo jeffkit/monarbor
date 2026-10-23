@@ -315,3 +315,41 @@ def test_load_assertions_rejects_malformed(tmp_path: Path):
         assert "assertions" in str(e)
     else:
         raise AssertionError("畸形断言表应抛 ValueError")
+
+
+# 18 ── yaml_path_equals（gov 治理账本断言）
+
+def test_yaml_path_equals(tmp_path: Path):
+    _write(tmp_path, "gov/architecture.yaml", (
+        "gov:\n"
+        "  runtime_valid_set: [go, python, rust]\n"
+        "  owner: jeffkit\n"
+        "  review_by: '2027-01-31'\n"
+    ))
+    results = _run(tmp_path, [
+        {"id": "list-ok", "check": "yaml_path_equals", "file": "gov/architecture.yaml",
+         "path": "gov.runtime_valid_set", "expected": ["go", "python", "rust"]},
+        {"id": "scalar-ok", "check": "yaml_path_equals", "file": "gov/architecture.yaml",
+         "path": "gov.owner", "expected": "jeffkit"},
+        {"id": "value-drift", "check": "yaml_path_equals", "file": "gov/architecture.yaml",
+         "path": "gov.owner", "expected": "someone-else"},
+        {"id": "leaf-missing", "check": "yaml_path_equals", "file": "gov/architecture.yaml",
+         "path": "gov.no_such_key", "expected": "x"},
+        {"id": "mid-missing", "check": "yaml_path_equals", "file": "gov/architecture.yaml",
+         "path": "no_such_table.owner", "expected": "x"},
+        {"id": "file-missing", "check": "yaml_path_equals", "file": "gov/nope.yaml",
+         "path": "gov.owner", "expected": "x"},
+        {"id": "quoted-date-is-string", "check": "yaml_path_equals", "file": "gov/architecture.yaml",
+         "path": "gov.review_by", "expected": "2027-01-31"},
+    ])
+    assert results["list-ok"].ok
+    assert results["scalar-ok"].ok
+    assert not results["value-drift"].ok
+    assert not results["leaf-missing"].ok
+    assert "不存在" in results["leaf-missing"].detail
+    assert not results["mid-missing"].ok
+    assert not results["file-missing"].ok
+    assert "文件不存在" in results["file-missing"].detail
+    # 带引号的 ISO 日期解析为字符串，与字符串字面量一致（类型敏感比对，
+    # 防 YAML 把裸日期隐式解析成 date 造成假绿）
+    assert results["quoted-date-is-string"].ok

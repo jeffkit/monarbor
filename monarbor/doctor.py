@@ -7,7 +7,8 @@
 
     file_exists / glob_min / regex_count / regex_contains / regex_contains_all /
     regex_not_contains / dep_present / entry_points_count /
-    mona_paths_gitignored / table_rows_matches_mona / backtick_paths_exist
+    mona_paths_gitignored / table_rows_matches_mona / backtick_paths_exist /
+    yaml_path_equals
 
 设计约定：
 * 断言字段形状直接对齐大仓 ``docs/DOC_ASSERTIONS.yml``，不引入额外必填字段；
@@ -601,6 +602,33 @@ def check_backtick_paths_exist(assertion: dict, root: Path) -> tuple[bool, str]:
     return True, f"{assertion['file']}: {checked} 个引用路径全部存在"
 
 
+def check_yaml_path_equals(assertion: dict, root: Path) -> tuple[bool, str]:
+    """结构化账本断言：YAML 文件中 ``path``（点分键路径）处的值 == ``expected``。
+
+    用于治理账本类断言（如 ``plaita/docs/governance/architecture.yaml`` 的
+    ``gov/*``）。两侧都经 ``yaml.safe_load`` 解析后按 Python 值比对，类型敏感：
+    账本里带引号的 ISO 日期（字符串）只与字符串字面量相等，与被 YAML 隐式
+    解析成 date 的裸日期不等——这是有意为之，防止隐式类型漂移。
+    """
+    rel = _require(assertion, "file")
+    dotted = str(_require(assertion, "path"))
+    expected = _require(assertion, "expected")
+    path = root / rel
+    if not path.is_file():
+        raise CheckError(f"文件不存在: {rel}")
+    node = yaml.safe_load(path.read_text(encoding="utf-8"))
+    walked = []
+    for key in dotted.split("."):
+        walked.append(key)
+        if not isinstance(node, dict) or key not in node:
+            return False, f"{rel}: 路径 {'.'.join(walked)} 不存在"
+        node = node[key]
+    return (
+        node == expected,
+        f"{rel}: {dotted} = {node!r}（期望 {expected!r}）",
+    )
+
+
 CHECKS: dict[str, Callable[[dict, Path], tuple[bool, str]]] = {
     "file_exists": check_file_exists,
     "glob_min": check_glob_min,
@@ -613,6 +641,7 @@ CHECKS: dict[str, Callable[[dict, Path], tuple[bool, str]]] = {
     "mona_paths_gitignored": check_mona_paths_gitignored,
     "table_rows_matches_mona": check_table_rows_matches_mona,
     "backtick_paths_exist": check_backtick_paths_exist,
+    "yaml_path_equals": check_yaml_path_equals,
 }
 
 

@@ -11,6 +11,10 @@ pipx install monarbor
 > 需要 **monarbor ≥ 0.5.0**：0.4.0 及更早版本存在 `list` 嵌套扫描崩溃（软链环）等缺陷，
 > 请升级后再用。pip 默认走内网镜像时新版本同步有延迟，可显式指定官方源：
 > `pipx install monarbor --pip-args='--index-url https://pypi.org/simple --extra-index-url https://pypi.org/simple'`
+>
+> 📌 **版本页说明**：PyPI 描述随版本固化、不可回改——若版本页上出现「发布新版本前暂缓安装」
+> 的警告，说明你打开的是 **0.5.0 及更早的旧版本页**。该警告针对的是早已被修复的 0.4.0 缺陷，
+> 对最新版不成立；请直接安装最新版。
 
 开发未发布版 / 内网无法访问 PyPI 时，可从仓库安装：
 
@@ -125,7 +129,7 @@ monarbor list -r       # 递归列出树形结构
 ```bash
 cd <大仓根>
 monarbor doctor                 # 人读输出；未配置断言表则跳过（退出 0）
-monarbor doctor --init          # 生成带注释的起步模板
+monarbor doctor --init          # 生成起步模板（示例断言默认注释，空目录起步即绿）
 monarbor doctor --json          # CI 消费（跳过时含 "skipped": true）
 monarbor doctor --strict        # 未配置断言表视为失败（退出 1）
 monarbor doctor --file path/to/DOC_ASSERTIONS.yml

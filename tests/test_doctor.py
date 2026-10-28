@@ -461,13 +461,11 @@ def test_cli_doctor_explicit_missing_file_fails(tmp_path: Path, monkeypatch):
     assert result.exit_code == 1
 
 
-# 22 ── CLI --init：生成模板、新仓开箱即绿、已存在拒绝
+# 22 ── CLI --init：空目录起步即绿（示例默认注释）、已存在拒绝
 
 def test_cli_doctor_init_template(tmp_path: Path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    _write_mona(tmp_path, [])
-    _write(tmp_path, "README.md", "# t\n")
-
+    # 刻意不写 README/mona.yaml——--init 的真实起点常是「还不是大仓」的空目录
     created = CliRunner().invoke(main, ["doctor", "--init"])
     assert created.exit_code == 0, created.output
     assert (tmp_path / "docs/DOC_ASSERTIONS.yml").is_file()
@@ -475,7 +473,10 @@ def test_cli_doctor_init_template(tmp_path: Path, monkeypatch):
     result = CliRunner().invoke(main, ["doctor", "--json"])
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert payload["ok"] is True and payload["total"] >= 2
+    assert payload["ok"] is True and payload["total"] == 0
+
+    table = (tmp_path / "docs/DOC_ASSERTIONS.yml").read_text(encoding="utf-8")
+    assert "check: mona_paths_gitignored" in table  # 示例仍在，只是注释
 
     duplicate = CliRunner().invoke(main, ["doctor", "--init"])
     assert duplicate.exit_code == 1

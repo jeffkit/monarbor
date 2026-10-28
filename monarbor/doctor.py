@@ -59,33 +59,37 @@ def resolve_assertions_path(root: Path) -> Path:
 
 
 ASSERTIONS_TEMPLATE = """\
-# monarbor doctor 断言表（monarbor doctor --init 生成，按需增删）
+# monarbor doctor 断言表（monarbor doctor --init 生成，按需取消注释/增删）
 # 用法：大仓根运行 monarbor doctor；CI 加 --json（失败退出码 1）。
 # 断言表不存在时 doctor 跳过并退出 0；--strict 可改为强制报错。
+#
+# 起步为空表（doctor 直接通过）——下面示例断言依赖「大仓结构已成形」，
+# 在刚起步的目录里必然失败，故默认注释，按需启用。
 version: 1
 
-assertions:
-  # README 存在
-  - id: root/readme-exists
-    desc: README.md 存在
-    check: file_exists
-    path: README.md
+assertions: []
 
-  # 根目录至少 1 个 Markdown 文档
-  - id: root/docs-not-empty
-    desc: 根目录至少 1 个 .md 文档
-    check: glob_min
-    path: .
-    pattern: "*.md"
-    min: 1
-
-  # mona.yaml 声明的子仓 path 必须都被 .gitignore 覆盖（防止子仓被误提交进大仓）
-  - id: root/mona-paths-ignored
-    desc: .gitignore 覆盖 mona.yaml 全部子仓 path
-    check: mona_paths_gitignored
-
-  # 更多 check 类型（regex_contains / dep_present / entry_points_count /
-  # table_rows_matches_mona / backtick_paths_exist / yaml_path_equals …）见 README。
+# 示例：README 存在
+# - id: root/readme-exists
+#   desc: README.md 存在
+#   check: file_exists
+#   path: README.md
+#
+# 示例：根目录至少 1 个 Markdown 文档
+# - id: root/docs-not-empty
+#   desc: 根目录至少 1 个 .md 文档
+#   check: glob_min
+#   path: .
+#   pattern: "*.md"
+#   min: 1
+#
+# 示例：mona.yaml 声明的子仓 path 必须都被 .gitignore 覆盖（防止子仓被误提交进大仓）
+# - id: root/mona-paths-ignored
+#   desc: .gitignore 覆盖 mona.yaml 全部子仓 path
+#   check: mona_paths_gitignored
+#
+# 更多 check 类型（regex_contains / dep_present / entry_points_count /
+# table_rows_matches_mona / backtick_paths_exist / yaml_path_equals …）见 README。
 """
 
 

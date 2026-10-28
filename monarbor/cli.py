@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import threading
 from pathlib import Path
 
@@ -21,7 +22,13 @@ from .config import (
     registered_repo_abs_paths,
     walk_monorepos,
 )
-from .doctor import DEFAULT_ASSERTIONS_FILE, load_assertions, run_assertions
+from .doctor import (
+    DEFAULT_ASSERTIONS_FILE,
+    init_assertions,
+    load_assertions,
+    resolve_assertions_path,
+    run_assertions,
+)
 from .git_ops import (
     CloneOptions,
     ahead_behind,
@@ -391,25 +398,67 @@ def list_repos(recursive: bool):
 
 
 @main.command(name="doctor")
-@click.option("--file", "assertions_file", default=DEFAULT_ASSERTIONS_FILE, show_default=True,
-              help="断言表路径（相对 cwd，默认 docs/DOC_ASSERTIONS.yml）")
+@click.option("--file", "assertions_file", default=None,
+              help="断言表路径（相对 cwd 或大仓根；缺省按 mona.yaml assertions 字段 → "
+                   ".monarbor/assertions.yml → docs/DOC_ASSERTIONS.yml → DOC_ASSERTIONS.yml 探测）")
 @click.option("--root", "root_opt", default=None, help="大仓根目录（默认当前目录）")
 @click.option("--json", "as_json", is_flag=True, help="以 JSON 输出机器可读结果（供 CI 消费）")
-def doctor(assertions_file: str, root_opt: str | None, as_json: bool):
+@click.option("--strict", is_flag=True, help="断言表缺失时报错退出 1（缺省：跳过并退出 0）")
+@click.option("--init", "do_init", is_flag=True,
+              help="生成带注释的断言表起步模板（docs/DOC_ASSERTIONS.yml）后退出；已存在则拒绝")
+def doctor(assertions_file: str | None, root_opt: str | None, as_json: bool,
+           strict: bool, do_init: bool):
     """逐条执行文档事实断言表，失败即文档漂移（退出码 1）。
 
     \b
     示例:
-      monarbor doctor              # 在大仓根运行，人读输出
-      monarbor doctor --json       # CI 消费
+      monarbor doctor              # 在大仓根运行；未配置断言表则跳过（退出 0）
+      monarbor doctor --init       # 生成断言表起步模板
+      monarbor doctor --json       # CI 消费（跳过时含 "skipped": true）
+      monarbor doctor --strict     # 未配置断言表视为失败
       monarbor doctor --file /path/to/DOC_ASSERTIONS.yml
     """
     root = Path(root_opt).resolve() if root_opt else Path.cwd().resolve()
 
-    assertions_path = Path(assertions_file)
-    if not assertions_path.is_absolute():
-        candidate = Path.cwd() / assertions_file
-        assertions_path = candidate if candidate.exists() else root / assertions_file
+    if do_init:
+        target = root / DEFAULT_ASSERTIONS_FILE
+        if init_assertions(target):
+            console.print(f"[green]✓[/green] 已生成断言表模板: {target}")
+        else:
+            raise click.ClickException(f"断言表已存在: {target}（如需重来请先删除）")
+        return
+
+    explicit = assertions_file is not None
+    if explicit:
+        assertions_path = Path(assertions_file)
+        if not assertions_path.is_absolute():
+            candidate = Path.cwd() / assertions_file
+            assertions_path = candidate if candidate.exists() else root / assertions_file
+    else:
+        assertions_path = resolve_assertions_path(root)
+
+    if not assertions_path.exists():
+        if explicit or strict:
+            note = "" if explicit else "（--strict 将缺表视为失败）"
+            raise click.ClickException(f"断言表不存在: {assertions_path}{note}")
+        # 「没写断言」不是「断言不成立」：跳过并退出 0，让 CI 可以放心挂上 doctor
+        if as_json:
+            click.echo(json.dumps({
+                "file": str(assertions_path),
+                "root": str(root),
+                "skipped": True,
+                "total": 0,
+                "passed": 0,
+                "failed": 0,
+                "ok": True,
+                "results": [],
+            }, ensure_ascii=False, indent=2))
+        else:
+            console.print(
+                f"[yellow]未配置断言表（{assertions_path}），跳过 doctor——"
+                f"--init 可生成模板，--strict 可改为强制报错[/yellow]"
+            )
+        return
 
     try:
         assertions = load_assertions(assertions_path)
@@ -421,11 +470,10 @@ def doctor(assertions_file: str, root_opt: str | None, as_json: bool):
     failed = len(results) - passed
 
     if as_json:
-        import json
-
         click.echo(json.dumps({
             "file": str(assertions_path),
             "root": str(root),
+            "skipped": False,
             "total": len(results),
             "passed": passed,
             "failed": failed,

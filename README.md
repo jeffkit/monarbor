@@ -4,11 +4,15 @@ AI 友好的逻辑大仓命令行工具。一个 `mona.yaml` 配置文件描述�
 
 ## 安装
 
-> ⚠️ **PyPI 上的 0.4.0 早于本轮修复**：软链环崩溃（缺陷 A）与 `list` 漏传排除集（缺陷 B）
-> 在 PyPI 0.4.0 中仍存在，且尚无新版本发布。**在发布新版本之前，请勿 `pip install monarbor`**，
-> 改用下面的「从仓库安装」。
+```bash
+pipx install monarbor
+```
 
-从仓库安装（推荐，含本轮修复）：
+> 需要 **monarbor ≥ 0.5.0**：0.4.0 及更早版本存在 `list` 嵌套扫描崩溃（软链环）等缺陷，
+> 请升级后再用。pip 默认走内网镜像时新版本同步有延迟，可显式指定官方源：
+> `pipx install monarbor --pip-args='--index-url https://pypi.org/simple --extra-index-url https://pypi.org/simple'`
+
+开发未发布版 / 内网无法访问 PyPI 时，可从仓库安装：
 
 ```bash
 # 从 GitHub 安装
@@ -54,7 +58,7 @@ monarbor status
 | `monarbor pull` | 更新所有已 clone 仓库的代码 |
 | `monarbor status` | 显示所有仓库的分支、改动、同步状态 |
 | `monarbor list` | 以树形结构列出所有仓库 |
-| `monarbor doctor` | 逐条执行 `docs/DOC_ASSERTIONS.yml` 文档事实断言，失败退出码 1 |
+| `monarbor doctor` | 执行文档事实断言表（自动探测，`--init` 生成模板），失败退出码 1 |
 | `monarbor exec <cmd>` | 在所有仓库中执行命令 |
 | `monarbor checkout <dev\|test\|prod>` | 批量切换到指定分支类型 |
 | `monarbor init` | 初始化新的逻辑大仓 |
@@ -113,20 +117,34 @@ monarbor list -r       # 递归列出树形结构
 
 ### 文档事实体检
 
-大仓可在 `docs/DOC_ASSERTIONS.yml` 里把「文档声称的跨仓事实」写成机器可校验断言，
-`monarbor doctor` 逐条执行；任一失败即文档漂移，退出码 1：
+大仓可把「文档声称的跨仓事实」写成机器可校验断言，`monarbor doctor` 逐条执行；
+任一失败即文档漂移，退出码 1。断言表位置按序探测：`mona.yaml` 的 `assertions:` 字段 →
+`.monarbor/assertions.yml` → `docs/DOC_ASSERTIONS.yml` → `DOC_ASSERTIONS.yml`；
+**都未配置时 doctor 跳过并退出 0**（「没写断言」不是「断言不成立」），`--strict` 可改为报错：
 
 ```bash
 cd <大仓根>
-monarbor doctor                 # 人读输出
-monarbor doctor --json          # CI 消费
+monarbor doctor                 # 人读输出；未配置断言表则跳过（退出 0）
+monarbor doctor --init          # 生成带注释的起步模板
+monarbor doctor --json          # CI 消费（跳过时含 "skipped": true）
+monarbor doctor --strict        # 未配置断言表视为失败（退出 1）
 monarbor doctor --file path/to/DOC_ASSERTIONS.yml
+```
+
+mona.yaml 也可声明断言表位置：
+
+```yaml
+assertions: docs/my-assertions.yml
 ```
 
 支持的 check 类型：`file_exists`、`glob_min`、`regex_count`、`regex_contains`、
 `regex_contains_all`、`regex_not_contains`、`dep_present`（npm/cargo/pyp）、
 `entry_points_count`、`mona_paths_gitignored`、`table_rows_matches_mona`、
-`backtick_paths_exist`。
+`backtick_paths_exist`、`yaml_path_equals`。
+
+> `mona_paths_gitignored` 直接调 `git check-ignore` 判定，白名单式 `.gitignore`
+> （`/*` + `!` 放行）、negation、`**/`、`.git/info/exclude` 均正确生效；
+> 仅在非 git 环境回退字面前缀解析（可能误报）。
 
 ## mona.yaml 格式
 

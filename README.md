@@ -168,6 +168,10 @@ repos:
       prod: main
 ```
 
+## 更新日志
+
+每个版本修了什么、加了什么，见 [CHANGELOG.md](./CHANGELOG.md)——PyPI 版本页描述随版本固化不可回改，CHANGELOG 是唯一持续可更正的发布史。
+
 ## License
 
 MIT

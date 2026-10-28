@@ -10,6 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       id-token: write
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -38,3 +39,11 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+
+      # 每个版本一份 GitHub Release notes（自动汇总自上个 tag 以来的提交）；
+      # 详细变更史见 CHANGELOG.md（唯一持续可更正的发布史——PyPI 页描述随版本固化）
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "$GITHUB_REF_NAME" --generate-notes --title "monarbor $GITHUB_REF_NAME"

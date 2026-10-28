@@ -8,13 +8,19 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import yaml
 from click.testing import CliRunner
 
 from monarbor.cli import main
-from monarbor.doctor import load_assertions, parse_minimal_toml, run_assertions
+from monarbor.doctor import (
+    load_assertions,
+    parse_minimal_toml,
+    resolve_assertions_path,
+    run_assertions,
+)
 
 
 def _write(root: Path, rel: str, content: str) -> Path:
@@ -353,3 +359,124 @@ def test_yaml_path_equals(tmp_path: Path):
     # 带引号的 ISO 日期解析为字符串，与字符串字面量一致（类型敏感比对，
     # 防 YAML 把裸日期隐式解析成 date 造成假绿）
     assert results["quoted-date-is-string"].ok
+
+
+# 19 ── mona_paths_gitignored：白名单式 .gitignore（/* + ! 放行）交 git 判定
+
+def _git(repo: Path, *args: str) -> None:
+    subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+
+
+def test_mona_paths_gitignored_whitelist_style(tmp_path: Path):
+    # infra4agent 式白名单：/* 全忽略 + ! 放行元文件；子仓靠 /* 覆盖。
+    # 旧字面解析把 /* 归一化成 * 永远匹配不上 → 全量误报；git 判定应通过。
+    _write_mona(tmp_path, [{"path": "es-agent-service"}, {"path": "alpha"}])
+    _write(tmp_path, ".gitignore", "/*\n!/README.md\n!/mona.yaml\n!/.gitignore\n")
+    _git(tmp_path, "init", "-q")
+    results = _run(tmp_path, [{"id": "g", "check": "mona_paths_gitignored"}])
+    assert results["g"].ok, results["g"].detail
+
+
+def test_mona_paths_gitignored_negated_path_reported_missing(tmp_path: Path):
+    # 被 ! 放行的子仓 path 确实不被忽略 → 应判失败（否则子仓会被误提交进大仓）
+    _write_mona(tmp_path, [{"path": "keep"}])
+    _write(tmp_path, ".gitignore", "/*\n!/keep/\n")
+    _git(tmp_path, "init", "-q")
+    results = _run(tmp_path, [{"id": "g", "check": "mona_paths_gitignored"}])
+    assert not results["g"].ok
+    assert "keep" in results["g"].detail
+
+
+def test_mona_paths_gitignored_dir_pattern_without_clone(tmp_path: Path):
+    # fresh 大仓：/alpha/ 型目录规则 + 子仓目录尚未 clone（不存在）也应命中
+    _write_mona(tmp_path, [{"path": "alpha"}])
+    _write(tmp_path, ".gitignore", "/alpha/\n")
+    _git(tmp_path, "init", "-q")
+    results = _run(tmp_path, [{"id": "g", "check": "mona_paths_gitignored"}])
+    assert results["g"].ok, results["g"].detail
+
+
+def test_mona_paths_gitignored_fallback_without_git(tmp_path: Path):
+    # 非 git 目录 → 回退字面解析，字面规则仍可用
+    _write_mona(tmp_path, [{"path": "alpha"}, {"path": "gamma"}])
+    _write(tmp_path, ".gitignore", "/alpha/\n/gamma/\n")
+    results = _run(tmp_path, [{"id": "g", "check": "mona_paths_gitignored"}])
+    assert results["g"].ok
+    assert "回退字面解析" in results["g"].detail
+
+
+# 20 ── 断言表解析序：mona.yaml assertions 字段 > .monarbor/ > docs/ > 根
+
+def test_resolve_assertions_probe_order(tmp_path: Path):
+    _write_mona(tmp_path, [])
+    default = tmp_path / "docs/DOC_ASSERTIONS.yml"
+    assert resolve_assertions_path(tmp_path) == default  # 全部未命中 → 默认路径（可不存在）
+
+    _write(tmp_path, "docs/DOC_ASSERTIONS.yml", "assertions: []\n")
+    assert resolve_assertions_path(tmp_path) == default
+
+    _write(tmp_path, ".monarbor/assertions.yml", "assertions: []\n")
+    assert resolve_assertions_path(tmp_path) == tmp_path / ".monarbor/assertions.yml"
+
+    _write(tmp_path, "DOC_ASSERTIONS.yml", "assertions: []\n")
+    assert resolve_assertions_path(tmp_path) == tmp_path / ".monarbor/assertions.yml"
+
+    _write(tmp_path, "mona.yaml", yaml.dump(
+        {"name": "t", "repos": [], "assertions": "custom/a.yml"}, allow_unicode=True))
+    assert resolve_assertions_path(tmp_path) == tmp_path / "custom/a.yml"
+
+
+# 21 ── CLI：缺断言表跳过退出 0（JSON 含 skipped），--strict / 显式 --file 缺失报错
+
+def test_cli_doctor_missing_assertions_skips(tmp_path: Path, monkeypatch):
+    _write_mona(tmp_path, [])
+    monkeypatch.chdir(tmp_path)
+
+    result = CliRunner().invoke(main, ["doctor", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["skipped"] is True
+    assert payload["ok"] is True and payload["total"] == 0
+
+    human = CliRunner().invoke(main, ["doctor"])
+    assert human.exit_code == 0
+    assert "未配置断言表" in human.output  # 不取句中词，rich 可能折行
+
+
+def test_cli_doctor_missing_assertions_strict_fails(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    result = CliRunner().invoke(main, ["doctor", "--strict"])
+
+    assert result.exit_code == 1
+    assert "断言表不存在" in result.output
+
+
+def test_cli_doctor_explicit_missing_file_fails(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    result = CliRunner().invoke(main, ["doctor", "--file", "nope.yml"])
+
+    assert result.exit_code == 1
+
+
+# 22 ── CLI --init：生成模板、新仓开箱即绿、已存在拒绝
+
+def test_cli_doctor_init_template(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _write_mona(tmp_path, [])
+    _write(tmp_path, "README.md", "# t\n")
+
+    created = CliRunner().invoke(main, ["doctor", "--init"])
+    assert created.exit_code == 0, created.output
+    assert (tmp_path / "docs/DOC_ASSERTIONS.yml").is_file()
+
+    result = CliRunner().invoke(main, ["doctor", "--json"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["ok"] is True and payload["total"] >= 2
+
+    duplicate = CliRunner().invoke(main, ["doctor", "--init"])
+    assert duplicate.exit_code == 1
+    assert "已存在" in duplicate.output

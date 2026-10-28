@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -27,6 +28,74 @@ from typing import Any, Callable
 import yaml
 
 DEFAULT_ASSERTIONS_FILE = "docs/DOC_ASSERTIONS.yml"
+
+# 断言表探测序（mona.yaml 的 assertions 字段优先于此二者）
+ASSERTIONS_PROBE_PATHS = (
+    ".monarbor/assertions.yml",
+    "docs/DOC_ASSERTIONS.yml",
+    "DOC_ASSERTIONS.yml",
+)
+
+
+def resolve_assertions_path(root: Path) -> Path:
+    """断言表解析序：mona.yaml 的 ``assertions:`` 字段 → 探测序中第一个存在者 → 默认路径。
+
+    全部未命中时返回默认路径（允许不存在——由 CLI 侧决定跳过还是报错）。
+    """
+    mona = root / "mona.yaml"
+    if mona.is_file():
+        try:
+            data = yaml.safe_load(mona.read_text(encoding="utf-8")) or {}
+        except yaml.YAMLError:
+            data = {}
+        custom = data.get("assertions")
+        if custom:
+            return root / str(custom)
+    for rel in ASSERTIONS_PROBE_PATHS:
+        candidate = root / rel
+        if candidate.is_file():
+            return candidate
+    return root / DEFAULT_ASSERTIONS_FILE
+
+
+ASSERTIONS_TEMPLATE = """\
+# monarbor doctor 断言表（monarbor doctor --init 生成，按需增删）
+# 用法：大仓根运行 monarbor doctor；CI 加 --json（失败退出码 1）。
+# 断言表不存在时 doctor 跳过并退出 0；--strict 可改为强制报错。
+version: 1
+
+assertions:
+  # README 存在
+  - id: root/readme-exists
+    desc: README.md 存在
+    check: file_exists
+    path: README.md
+
+  # 根目录至少 1 个 Markdown 文档
+  - id: root/docs-not-empty
+    desc: 根目录至少 1 个 .md 文档
+    check: glob_min
+    path: .
+    pattern: "*.md"
+    min: 1
+
+  # mona.yaml 声明的子仓 path 必须都被 .gitignore 覆盖（防止子仓被误提交进大仓）
+  - id: root/mona-paths-ignored
+    desc: .gitignore 覆盖 mona.yaml 全部子仓 path
+    check: mona_paths_gitignored
+
+  # 更多 check 类型（regex_contains / dep_present / entry_points_count /
+  # table_rows_matches_mona / backtick_paths_exist / yaml_path_equals …）见 README。
+"""
+
+
+def init_assertions(path: Path) -> bool:
+    """写入起步模板；已存在则不动，返回是否实际创建。"""
+    if path.exists():
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(ASSERTIONS_TEMPLATE, encoding="utf-8")
+    return True
 
 
 class CheckError(Exception):
@@ -526,20 +595,54 @@ def _covered_by_gitignore(path: str, rules: list) -> bool:
     return any(target == rule or target.startswith(rule + "/") for rule in rules)
 
 
+def _git_check_ignored(root: Path, paths: list) -> list | None:
+    """直接问 git：哪些 path 命中 ignore 规则。
+
+    交给 git 判定可正确处理白名单（``/*`` + ``!`` 放行）、negation、``**/``、
+    嵌套 .gitignore 与 .git/info/exclude——这些靠解析规则文本都会误判。
+    输入 path 一律带尾斜杠（目录语义，使 ``/dir/`` 型规则对尚未 clone 的
+    不存在目录同样命中）；返回值已去掉尾斜杠。
+    git 不可用（无 git 命令 / 非 git 仓 / 超时）返回 None，由调用方回退内置解析。
+    """
+    if not paths:
+        return []
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(root), "check-ignore", "--no-index", "-z", "--stdin"],
+            input="\0".join(str(p).strip("/") + "/" for p in paths),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode not in (0, 1):  # 0=有命中 1=无命中；其余（如 128 非 git 仓）走回退
+        return None
+    return [p.rstrip("/") for p in proc.stdout.split("\0") if p]
+
+
 def check_mona_paths_gitignored(assertion: dict, root: Path) -> tuple[bool, str]:
     mona = root / "mona.yaml"
     if not mona.is_file():
         raise CheckError("mona.yaml 不存在")
     data = yaml.safe_load(mona.read_text(encoding="utf-8")) or {}
-    paths = [r.get("path") for r in (data.get("repos") or []) if r.get("path")]
-    gitignore = root / ".gitignore"
-    if not gitignore.is_file():
-        return False, ".gitignore 不存在"
-    rules = _gitignore_rules(gitignore.read_text(encoding="utf-8"))
-    missing = [p for p in paths if not _covered_by_gitignore(p, rules)]
+    paths = [str(r.get("path")).strip("/") for r in (data.get("repos") or []) if r.get("path")]
+    ignored = _git_check_ignored(root, paths)
+    if ignored is None:
+        # 非 git 环境兜底：字面前缀解析（不认白名单/negation，可能误报）
+        gitignore = root / ".gitignore"
+        if not gitignore.is_file():
+            return False, ".gitignore 不存在"
+        rules = _gitignore_rules(gitignore.read_text(encoding="utf-8"))
+        missing = [p for p in paths if not _covered_by_gitignore(p, rules)]
+        via = "（git 不可用，回退字面解析）"
+    else:
+        covered = set(ignored)
+        missing = [p for p in paths if p not in covered]
+        via = ""
     if missing:
-        return False, f"{len(missing)}/{len(paths)} 个子仓 path 未被 .gitignore 覆盖: {', '.join(missing)}"
-    return True, f"{len(paths)} 个子仓 path 全部被 .gitignore 覆盖"
+        return False, f"{len(missing)}/{len(paths)} 个子仓 path 未被 .gitignore 覆盖: {', '.join(missing)}{via}"
+    return True, f"{len(paths)} 个子仓 path 全部被 .gitignore 覆盖{via}"
 
 
 def check_table_rows_matches_mona(assertion: dict, root: Path) -> tuple[bool, str]:

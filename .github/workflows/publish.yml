@@ -23,5 +23,18 @@ jobs:
       - name: Build package
         run: python -m build
 
+      # PyPI 项目页 long_description 随版本固化、改不了——发布前机械拦截过期文案
+      - name: Guard README staleness
+        run: |
+          if grep -nE '请勿 *(pip|pipx) install|请勿安装' README.md; then
+            echo "::error::README 仍含「请勿安装」类过期表述——发布前必须把安装段更新为 pipx install monarbor（PyPI 描述随版本固化）"
+            exit 1
+          fi
+
+      - name: twine check
+        run: |
+          pip install twine
+          twine check dist/*
+
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
